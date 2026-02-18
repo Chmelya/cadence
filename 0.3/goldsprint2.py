@@ -167,7 +167,7 @@ SPEED_CHARACTERISTIC_UUID = "00002a5c-0000-1000-8000-00805f9b34fb"
 # Длина окружности колеса в метрах (для перевода оборотов в м/с). Типично ~2.1 м для 700c.
 WHEEL_CIRCUMFERENCE_M = 2.1
 # Интервал обновления интерфейса (мс) — время, макс. скорость, полоски скорости (обращение к данным датчиков)
-UI_REFRESH_MS = 25
+UI_REFRESH_MS = 4000
 # Если дольше этого времени (сек) нет данных с датчика — показываем скорость 0 (колесо остановилось)
 SPEED_STALE_SEC = 1.2
 # Интервал пинга датчиков (сек), чтобы они не уходили в сон
@@ -531,8 +531,8 @@ def reset_race():
         _stopwatch_after_id = None
     _update_stopwatch_labels()
     try:
-        max_speed_label1.config(text="0.00 м/с макс.")
-        max_speed_label2.config(text="0.00 м/с макс.")
+        max_speed_label1.config(text="0.00 км/ч макс.")
+        max_speed_label2.config(text="0.00 км/ч макс.")
     except NameError:
         pass
 
@@ -549,8 +549,8 @@ def update_gui():
     if t2 > 0 and (now - t2) > SPEED_STALE_SEC:
         rider2_speed = 0
     _update_stopwatch_labels()
-    max_speed_label1.config(text=f"{rider1_max_speed:.2f} м/с макс.")
-    max_speed_label2.config(text=f"{rider2_max_speed:.2f} м/с макс.")
+    max_speed_label1.config(text=f"{rider1_max_speed * 3.6:.2f} км/ч макс.")
+    max_speed_label2.config(text=f"{rider2_max_speed * 3.6:.2f} км/ч макс.")
     update_projection()
 
 # Функция для обновления проекции гонки
@@ -591,7 +591,7 @@ def update_projection(_event=None):
     bar1_w = min(int(rider1_speed * bar_scale), max_bar_w)
     if bar1_w > 0:
         _draw_round_rect(canvas, pad, y1, pad + bar1_w, y1 + bar_h, 14, fill=COLORS["rider1"], outline="")
-    canvas.create_text(pad + max_bar_w + 8, y1 + bar_h // 2, text=f"{rider1_speed:.1f} м/с", fill=COLORS["on_surface"], font=("Segoe UI", 10, "bold"), anchor="w")
+    canvas.create_text(pad + max_bar_w + 8, y1 + bar_h // 2, text=f"{rider1_speed * 3.6:.1f} км/ч", fill=COLORS["on_surface"], font=("Segoe UI", 10, "bold"), anchor="w")
 
     # Гонщик 2
     y2 = y1 + bar_h + gap + 30
@@ -599,7 +599,7 @@ def update_projection(_event=None):
     bar2_w = min(int(rider2_speed * bar_scale), max_bar_w)
     if bar2_w > 0:
         _draw_round_rect(canvas, pad, y2, pad + bar2_w, y2 + bar_h, 14, fill=COLORS["rider2"], outline="")
-    canvas.create_text(pad + max_bar_w + 8, y2 + bar_h // 2, text=f"{rider2_speed:.1f} м/с", fill=COLORS["on_surface"], font=("Segoe UI", 10, "bold"), anchor="w")
+    canvas.create_text(pad + max_bar_w + 8, y2 + bar_h // 2, text=f"{rider2_speed * 3.6:.1f} км/ч", fill=COLORS["on_surface"], font=("Segoe UI", 10, "bold"), anchor="w")
 
 # Функция для установки расстояния
 def set_distance():
@@ -1136,7 +1136,7 @@ row1 = tk.Frame(card_riders, bg=COLORS["surface_card"])
 row1.pack(fill=tk.X)
 time_label1 = tk.Label(row1, text="0.00 сек", font=("Segoe UI", 14, "bold"), fg=COLORS["rider1"], bg=COLORS["surface_card"])
 time_label1.pack(side=tk.LEFT)
-max_speed_label1 = tk.Label(row1, text="0.00 м/с макс.", font=font_caption, fg=COLORS["on_surface_secondary"], bg=COLORS["surface_card"])
+max_speed_label1 = tk.Label(row1, text="0.00 км/ч макс.", font=font_caption, fg=COLORS["on_surface_secondary"], bg=COLORS["surface_card"])
 max_speed_label1.pack(side=tk.LEFT, padx=(16, 0))
 sensor_status_label1 = tk.Label(row1, text="Не подключён", font=font_caption, fg=COLORS["on_surface_secondary"], bg=COLORS["surface_card"])
 sensor_status_label1.pack(side=tk.RIGHT)
@@ -1147,7 +1147,7 @@ row2 = tk.Frame(card_riders, bg=COLORS["surface_card"])
 row2.pack(fill=tk.X)
 time_label2 = tk.Label(row2, text="0.00 сек", font=("Segoe UI", 14, "bold"), fg=COLORS["rider2"], bg=COLORS["surface_card"])
 time_label2.pack(side=tk.LEFT)
-max_speed_label2 = tk.Label(row2, text="0.00 м/с макс.", font=font_caption, fg=COLORS["on_surface_secondary"], bg=COLORS["surface_card"])
+max_speed_label2 = tk.Label(row2, text="0.00 км/ч макс.", font=font_caption, fg=COLORS["on_surface_secondary"], bg=COLORS["surface_card"])
 max_speed_label2.pack(side=tk.LEFT, padx=(16, 0))
 sensor_status_label2 = tk.Label(row2, text="Не подключён", font=font_caption, fg=COLORS["on_surface_secondary"], bg=COLORS["surface_card"])
 sensor_status_label2.pack(side=tk.RIGHT)
