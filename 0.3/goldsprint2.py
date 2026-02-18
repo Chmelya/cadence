@@ -13,8 +13,19 @@ else:
     RawAdvData = None
 import os
 import json
+import queue
 import threading
 import time
+
+# Базовая папка: при сборке в exe — папка с exe, иначе — папка скрипта
+def _base_path():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _debug_log(msg, data, hypothesis_id):
+    pass
 if sys.platform == "win32":
     try:
         import winsound
@@ -24,7 +35,7 @@ else:
     winsound = None
 
 # Адреса Bluetooth датчиков ThinkRider (по умолчанию; загружаются из config при наличии)
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cadence_config.json")
+CONFIG_PATH = os.path.join(_base_path(), "cadence_config.json")
 DEFAULT_RIDER1 = "01:55:16.6840"
 DEFAULT_RIDER2 = "01:58:00.9120"
 
@@ -166,10 +177,16 @@ RIDER1_ADDRESS, RIDER2_ADDRESS = load_sensor_addresses()
 SPEED_CHARACTERISTIC_UUID = "00002a5c-0000-1000-8000-00805f9b34fb"
 # Длина окружности колеса в метрах (для перевода оборотов в м/с). Типично ~2.1 м для 700c.
 WHEEL_CIRCUMFERENCE_M = 2.1
-# Интервал обновления интерфейса (мс) — время, макс. скорость, полоски скорости (обращение к данным датчиков)
-UI_REFRESH_MS = 4000
+# Интервал обновления интерфейса (мс) — поток и таймер главного потока
+UI_REFRESH_MS = 16
+# Реальный рендер (полоски скорости, дистанции, подписи)
+UI_RENDER_MS = 16
 # Если дольше этого времени (сек) нет данных с датчика — показываем скорость 0 (колесо остановилось)
 SPEED_STALE_SEC = 1.2
+# Ниже этой скорости (км/ч) на UI показываем 0 (шум датчика при стоящем колесе)
+SPEED_DISPLAY_THRESHOLD_KMH = 0.6
+# Показывать 0 только после стольких подряд именно нулей из state (не «ниже порога»)
+CONSECUTIVE_ZEROS_REQUIRED = 3
 # Интервал пинга датчиков (сек), чтобы они не уходили в сон
 SENSOR_PING_INTERVAL_SEC = 15
 
@@ -177,30 +194,114 @@ SENSOR_PING_INTERVAL_SEC = 15
 ble_loop = None
 ble_tasks = []
 
-# Глобальные переменные для хранения данных
-distance = 0
-rider1_speed = 0
-rider2_speed = 0
-rider1_max_speed = 0
-rider2_max_speed = 0
-# Состояние CSC для расчёта скорости по дельте оборотов/времени (по rider_number)
-_csc_state = {}  # {rider_number: {"last_revs": int, "last_time": int}}
-# Время последнего обновления скорости по каждому гонщику (для сброса в 0 при остановке колеса)
-_last_speed_time = {1: 0, 2: 0}
-# Отладочный вывод сырых BLE-данных при неудачном разборе (не чаще раза в 2 сек на гонщика)
-_debug_raw_last = {1: 0, 2: 0}
-DEBUG_RAW_BLE = True  # выводить в консоль сырые данные, если скорость не распознана
+# Единственное общее хранилище данных (без разбросанных глобальных переменных).
+# Данные каждого датчика защищены своим замком: чтение/запись гонщика 1 и гонщика 2 могут идти в разных потоках без блокировки друг друга.
+class AppState:
+    """Потокобезопасное состояние: данные датчиков (по замку на гонщика) и гонки (общий замок)."""
+    __slots__ = (
+        "_lock_rider1", "_lock_rider2", "_lock_race",
+        "distance", "rider1_speed", "rider2_speed", "rider1_max_speed", "rider2_max_speed",
+        "_last_speed_time", "_csc_state", "_debug_raw_last",
+        "rider1_distance_traveled", "rider2_distance_traveled",
+        "race_start_time", "rider1_start_revs", "rider2_start_revs",
+        "rider1_finished_time", "rider2_finished_time", "_finished_beeped",
+        "_countdown_visible", "_countdown_after_ids", "_stopwatch_after_id",
+    )
 
-# Состояние гонки: stopwatch стартует по кнопке, останавливается когда гонщик проехал заданное расстояние
-race_start_time = None  # time.time() когда нажали Старт, иначе None
-rider1_start_revs = None  # cumulative wheel revs на старте (для подсчёта пройденной дистанции)
-rider2_start_revs = None
-rider1_finished_time = None  # сек от старта до финиша, или None если ещё не финишировал
-rider2_finished_time = None
-_stopwatch_after_id = None  # root.after id для периодического обновления секундомера
-_countdown_after_ids = []  # id таймеров обратного отсчёта (3, 2, 1) — отменить при сбросе
-_countdown_visible = 0  # 0 = нет, 1/2/3 = показывать число на экране
-_finished_beeped = {1: False, 2: False}  # звук при финише — один раз на гонщика за гонку
+    def __init__(self):
+        self._lock_rider1 = threading.Lock()
+        self._lock_rider2 = threading.Lock()
+        self._lock_race = threading.Lock()
+        self.distance = 250
+        self.rider1_speed = 0
+        self.rider2_speed = 0
+        self.rider1_max_speed = 0
+        self.rider2_max_speed = 0
+        self._last_speed_time = {1: 0, 2: 0}
+        self._csc_state = {}
+        self._debug_raw_last = {1: 0, 2: 0}
+        self.rider1_distance_traveled = 0.0
+        self.rider2_distance_traveled = 0.0
+        self.race_start_time = None
+        self.rider1_start_revs = None
+        self.rider2_start_revs = None
+        self.rider1_finished_time = None
+        self.rider2_finished_time = None
+        self._finished_beeped = {1: False, 2: False}
+        self._countdown_visible = 0
+        self._countdown_after_ids = []
+        self._stopwatch_after_id = None
+
+    def _lock_for_rider(self, rider_number):
+        return self._lock_rider1 if rider_number == 1 else self._lock_rider2
+
+    def get_snapshot(self):
+        """Снять снимок для UI. Читает данные каждого датчика под своим замком — можно вызывать из любого потока."""
+        now = time.time()
+        with self._lock_rider1:
+            t1 = self._last_speed_time.get(1, 0)
+            r1 = self.rider1_speed
+            stale_1 = t1 > 0 and (now - t1) > SPEED_STALE_SEC
+            if stale_1:
+                r1 = 0
+            r1_max = self.rider1_max_speed
+        with self._lock_rider2:
+            t2 = self._last_speed_time.get(2, 0)
+            r2 = self.rider2_speed
+            stale_2 = t2 > 0 and (now - t2) > SPEED_STALE_SEC
+            if stale_2:
+                r2 = 0
+            r2_max = self.rider2_max_speed
+        # #region agent log
+        if stale_1 or stale_2:
+            _debug_log("get_snapshot stale zero", {"stale_1": stale_1, "stale_2": stale_2, "r1": r1, "r2": r2, "now": now, "t1": t1, "t2": t2}, "H5")
+        # #endregion
+        with self._lock_race:
+            dist_target = self.distance
+            rider1_distance = min(self.rider1_distance_traveled, dist_target) if dist_target > 0 else 0.0
+            rider2_distance = min(self.rider2_distance_traveled, dist_target) if dist_target > 0 else 0.0
+            r1ft = self.rider1_finished_time
+            r2ft = self.rider2_finished_time
+            start = self.race_start_time
+            return {
+                "rider1_speed": r1, "rider2_speed": r2,
+                "rider1_max_speed": r1_max, "rider2_max_speed": r2_max,
+                "race_start_time": start,
+                "rider1_finished_time": r1ft, "rider2_finished_time": r2ft,
+                "countdown_visible": self._countdown_visible, "finished_beeped": dict(self._finished_beeped),
+                "distance": dist_target, "rider1_distance": rider1_distance, "rider2_distance": rider2_distance,
+            }
+
+    def reset_race_state(self):
+        """Сброс гонки. Вызывать из главного потока (держит _lock_race и кратко замки гонщиков)."""
+        with self._lock_race:
+            self.race_start_time = None
+            self.rider1_start_revs = None
+            self.rider2_start_revs = None
+            self.rider1_finished_time = None
+            self.rider2_finished_time = None
+            self._finished_beeped = {1: False, 2: False}
+            self._countdown_visible = 0
+            self.rider1_distance_traveled = 0.0
+            self.rider2_distance_traveled = 0.0
+        with self._lock_rider1:
+            self.rider1_max_speed = 0
+        with self._lock_rider2:
+            self.rider2_max_speed = 0
+
+
+app_state = AppState()
+
+# Очередь запросов на обновление UI: отдельный поток кладёт метки, главный поток забирает и обновляет виджеты
+_ui_update_queue = queue.Queue()
+# Состояние для фильтра фантомного нуля и редкого рендера (только главный поток)
+_display_speed_1 = 0.0
+_display_speed_2 = 0.0
+_consecutive_zeros_1 = 0
+_consecutive_zeros_2 = 0
+_last_render_time = 0.0
+
+DEBUG_RAW_BLE = True  # выводить в консоль сырые данные, если скорость не распознана
 COUNTDOWN_SEC = 3
 
 # Material Design colors
@@ -288,63 +389,79 @@ def _compute_speed_from_csc(last_revs, last_time, revs, wheel_time):
         delta_t += 65536  # rollover 16-bit
     if delta_t == 0:
         return None
+    if delta_revs == 0:
+        return None
     delta_t_sec = delta_t / 1024.0
     speed_m_s = (delta_revs * WHEEL_CIRCUMFERENCE_M) / delta_t_sec
     return speed_m_s
 
 
-# Функция для обработки данных с датчика скорости (CSC Measurement, вызывается из BLE-потока)
-def handle_speed_data(sender, data, rider_number):
-    global rider1_speed, rider2_speed, rider1_max_speed, rider2_max_speed
-    global rider1_finished_time, rider2_finished_time
+# Обработка данных с датчика скорости (CSC), вызывается из BLE-потока; пишет в state
+def handle_speed_data(sender, data, rider_number, state):
+    """Вызывается из BLE-потока (или из потока датчика). Данные гонщика пишутся под своим замком — датчики не блокируют друг друга."""
     try:
         revs, wheel_time = _parse_csc_speed(data)
         speed = None
-        if revs is not None:
-            state = _csc_state.setdefault(rider_number, {"last_revs": None, "last_time": None})
-            speed = _compute_speed_from_csc(state["last_revs"], state["last_time"], revs, wheel_time)
-            state["last_revs"] = revs
-            state["last_time"] = wheel_time
+        lock_rider = state._lock_for_rider(rider_number)
+        with lock_rider:
+            if revs is not None:
+                csc = state._csc_state.setdefault(rider_number, {"last_revs": None, "last_time": None})
+                speed = _compute_speed_from_csc(csc["last_revs"], csc["last_time"], revs, wheel_time)
+                csc["last_revs"] = revs
+                csc["last_time"] = wheel_time
         if speed is None:
             speed = _parse_indoor_bike_speed(data)
         if speed is None:
             speed = _parse_speed_fallback(data)
-        # Обновлять «последние данные» при любом пакете
-        _last_speed_time[rider_number] = time.time()
         if speed is None:
             if DEBUG_RAW_BLE and data:
                 now = time.time()
-                if now - _debug_raw_last.get(rider_number, 0) >= 2.0:
-                    _debug_raw_last[rider_number] = now
-                    raw_hex = data.hex() if hasattr(data, "hex") else "".join(f"{b:02x}" for b in data)
-                    print(f"[BLE rider {rider_number}] не распознано: len={len(data)} hex={raw_hex}")
+                with lock_rider:
+                    if now - state._debug_raw_last.get(rider_number, 0) >= 2.0:
+                        state._debug_raw_last[rider_number] = now
+                        raw_hex = data.hex() if hasattr(data, "hex") else "".join(f"{b:02x}" for b in data)
+                        print(f"[BLE rider {rider_number}] не распознано: len={len(data)} hex={raw_hex}")
             return
-        # Ограничиваем разумным диапазоном (м/с), чтобы отсечь выбросы
         if speed < 0 or speed > 100:
             return
-        if rider_number == 1:
-            rider1_speed = speed
-            if speed > rider1_max_speed:
-                rider1_max_speed = speed
-            # Финиш: проехал заданное расстояние (только при CSC — есть revs)
-            if revs is not None and race_start_time is not None and rider1_finished_time is None and rider1_start_revs is not None and distance > 0:
-                dist_m = (revs - rider1_start_revs) * WHEEL_CIRCUMFERENCE_M
-                if dist_m >= distance:
-                    rider1_finished_time = time.time() - race_start_time
-        elif rider_number == 2:
-            rider2_speed = speed
-            if speed > rider2_max_speed:
-                rider2_max_speed = speed
-            if revs is not None and race_start_time is not None and rider2_finished_time is None and rider2_start_revs is not None and distance > 0:
-                dist_m = (revs - rider2_start_revs) * WHEEL_CIRCUMFERENCE_M
-                if dist_m >= distance:
-                    rider2_finished_time = time.time() - race_start_time
+        threshold_ms = SPEED_DISPLAY_THRESHOLD_KMH / 3.6
+        with lock_rider:
+            now = time.time()
+            prev_time = state._last_speed_time.get(rider_number, now)
+            if speed >= threshold_ms:
+                state._last_speed_time[rider_number] = now
+                if rider_number == 1:
+                    state.rider1_speed = speed
+                    if speed > state.rider1_max_speed:
+                        state.rider1_max_speed = speed
+                else:
+                    state.rider2_speed = speed
+                    if speed > state.rider2_max_speed:
+                        state.rider2_max_speed = speed
+        with state._lock_race:
+            if speed >= threshold_ms and state.race_start_time is not None and state.distance > 0 and prev_time > 0:
+                dt = now - prev_time
+                if 0 < dt < 60:
+                    if rider_number == 1:
+                        state.rider1_distance_traveled = min(state.rider1_distance_traveled + speed * dt, state.distance)
+                        dist_now = state.rider1_distance_traveled
+                        finished = state.rider1_finished_time
+                    else:
+                        state.rider2_distance_traveled = min(state.rider2_distance_traveled + speed * dt, state.distance)
+                        dist_now = state.rider2_distance_traveled
+                        finished = state.rider2_finished_time
+                    if finished is None and dist_now >= state.distance:
+                        elapsed = time.time() - state.race_start_time
+                        if rider_number == 1:
+                            state.rider1_finished_time = elapsed
+                        else:
+                            state.rider2_finished_time = elapsed
+        try:
+            _ui_update_queue.put_nowait(True)
+        except queue.Full:
+            pass
     except (ValueError, IndexError, TypeError):
         return
-    try:
-        root.after(0, update_gui)
-    except NameError:
-        pass
 
 def _format_stopwatch(seconds):
     """Форматирование времени для секундомера: ММ:СС.сс"""
@@ -371,25 +488,32 @@ def _beep_finish():
             pass
 
 
-def _update_stopwatch_labels(schedule_next=False):
-    """Обновить обратный отсчёт, «кто финишировал / кто первый», и подписи времени секундомера."""
-    global _stopwatch_after_id, _finished_beeped
+def _update_stopwatch_labels(state):
+    """Обновить обратный отсчёт, «кто финишировал / кто первый», и подписи времени секундомера. Вызывается из главного потока."""
     try:
-        if _countdown_visible > 0:
-            countdown_label.config(text=str(_countdown_visible), font=("Segoe UI", 56, "bold"), fg=COLORS["primary"])
-        elif race_start_time is not None:
-            f1 = rider1_finished_time is not None
-            f2 = rider2_finished_time is not None
-            if not _finished_beeped.get(1, False) and f1:
+        with state._lock_race:
+            cd = state._countdown_visible
+            race_start = state.race_start_time
+            r1ft = state.rider1_finished_time
+            r2ft = state.rider2_finished_time
+            f1 = r1ft is not None
+            f2 = r2ft is not None
+            finished_beeped = dict(state._finished_beeped)
+        if cd > 0:
+            countdown_label.config(text=str(cd), font=("Segoe UI", 56, "bold"), fg=COLORS["primary"])
+        elif race_start is not None:
+            if not finished_beeped.get(1, False) and f1:
                 _beep_finish()
-                _finished_beeped[1] = True
-            if not _finished_beeped.get(2, False) and f2:
+                with state._lock_race:
+                    state._finished_beeped[1] = True
+            if not finished_beeped.get(2, False) and f2:
                 _beep_finish()
-                _finished_beeped[2] = True
+                with state._lock_race:
+                    state._finished_beeped[2] = True
             if f1 and f2:
-                if rider1_finished_time < rider2_finished_time:
+                if r1ft < r2ft:
                     countdown_label.config(text="Гонщик 1 — первый!", font=("Segoe UI", 20, "bold"), fg=COLORS["rider1"])
-                elif rider2_finished_time < rider1_finished_time:
+                elif r2ft < r1ft:
                     countdown_label.config(text="Гонщик 2 — первый!", font=("Segoe UI", 20, "bold"), fg=COLORS["rider2"])
                 else:
                     countdown_label.config(text="Ничья!", font=("Segoe UI", 20, "bold"), fg=COLORS["on_surface"])
@@ -401,19 +525,20 @@ def _update_stopwatch_labels(schedule_next=False):
                 countdown_label.config(text="", font=("Segoe UI", 56, "bold"), fg=COLORS["primary"])
         else:
             countdown_label.config(text="", font=("Segoe UI", 56, "bold"), fg=COLORS["primary"])
-        if race_start_time is None:
+        if race_start is None:
             time_label1.config(text="0.00 сек", font=("Segoe UI", 14, "bold"))
             time_label2.config(text="0.00 сек", font=("Segoe UI", 14, "bold"))
             return
         now = time.time()
-        elapsed = now - race_start_time
-        t1 = rider1_finished_time if rider1_finished_time is not None else elapsed
-        t2 = rider2_finished_time if rider2_finished_time is not None else elapsed
+        elapsed = now - race_start
+        t1 = r1ft if f1 else elapsed
+        t2 = r2ft if f2 else elapsed
         time_label1.config(text=_format_stopwatch(t1), font=("Segoe UI", 14, "bold"))
         time_label2.config(text=_format_stopwatch(t2), font=("Segoe UI", 14, "bold"))
-        _stopwatch_after_id = None
+        with state._lock_race:
+            state._stopwatch_after_id = None
     except NameError:
-        _stopwatch_after_id = None
+        pass
 
 
 def _beep():
@@ -430,106 +555,172 @@ def _beep():
             pass
 
 
-def _countdown_finished():
+def _countdown_finished(state):
     """По окончании обратного отсчёта: звук и старт секундомера."""
-    global race_start_time, rider1_start_revs, rider2_start_revs, rider1_finished_time, rider2_finished_time
-    global _countdown_visible, _countdown_after_ids, _finished_beeped
-    _countdown_visible = 0
-    _countdown_after_ids = []
-    _finished_beeped = {1: False, 2: False}
     _beep()
-    race_start_time = time.time()
-    rider1_start_revs = _csc_state.get(1, {}).get("last_revs")
-    rider2_start_revs = _csc_state.get(2, {}).get("last_revs")
-    rider1_finished_time = None
-    rider2_finished_time = None
+    with state._lock_race:
+        state._countdown_visible = 0
+        state._countdown_after_ids = []
+        state._finished_beeped = {1: False, 2: False}
+        state.race_start_time = time.time()
+        state.rider1_start_revs = state._csc_state.get(1, {}).get("last_revs")
+        state.rider2_start_revs = state._csc_state.get(2, {}).get("last_revs")
+        state.rider1_finished_time = None
+        state.rider2_finished_time = None
+        state.rider1_distance_traveled = 0.0
+        state.rider2_distance_traveled = 0.0
     try:
         start_race_button.config(state=tk.NORMAL)
     except NameError:
         pass
-    update_gui()
+    _ui_update_queue.put_nowait(True)
 
 
-def start_race():
+def start_race(state):
     """Старт гонки: обратный отсчёт 3–2–1, затем звук и секундомеры."""
-    global _countdown_visible, _countdown_after_ids, _stopwatch_after_id
-    if distance <= 0:
+    with state._lock_race:
+        dist = state.distance
+        after_ids = list(state._countdown_after_ids)
+        stopwatch_id = state._stopwatch_after_id
+    if dist <= 0:
         try:
             messagebox.showinfo("Гонка", "Сначала установите расстояние (м).", parent=root)
         except Exception:
             pass
         return
-    # Отменить предыдущий обратный отсчёт, если был
-    for aid in _countdown_after_ids:
+    for aid in after_ids:
         try:
             root.after_cancel(aid)
         except Exception:
             pass
-    _countdown_after_ids = []
-    if _stopwatch_after_id is not None:
+    if stopwatch_id is not None:
         try:
-            root.after_cancel(_stopwatch_after_id)
+            root.after_cancel(stopwatch_id)
         except Exception:
             pass
-    _countdown_visible = 3
+    with state._lock_race:
+        state._countdown_after_ids = []
+        state._countdown_visible = 3
     try:
         start_race_button.config(state=tk.DISABLED)
     except NameError:
         pass
-    update_gui()
-    # 3 → 2 через 1 с, 2 → 1 через 2 с, через 3 с — старт и звук
-    a1 = root.after(1000, lambda: _set_countdown(2))
-    a2 = root.after(2000, lambda: _set_countdown(1))
-    a3 = root.after(3000, _countdown_finished)
-    _countdown_after_ids = [a1, a2, a3]
+    _ui_update_queue.put_nowait(True)
+    a1 = root.after(1000, lambda: _set_countdown(2, state))
+    a2 = root.after(2000, lambda: _set_countdown(1, state))
+    a3 = root.after(3000, lambda: _countdown_finished(state))
+    with state._lock_race:
+        state._countdown_after_ids = [a1, a2, a3]
 
 
-def _set_countdown(n):
-    global _countdown_visible
-    _countdown_visible = n
-    update_gui()
+def _set_countdown(n, state):
+    with state._lock_race:
+        state._countdown_visible = n
+    _ui_update_queue.put_nowait(True)
 
 
-def _ui_refresh_loop():
-    """Периодическое обновление интерфейса (время, скорость, полоски)."""
+def _ui_refresh_worker(state):
+    """Поток обновления UI: непрерывно кладёт запрос на обновление в очередь каждые UI_REFRESH_MS мс."""
+    while True:
+        try:
+            time.sleep(UI_REFRESH_MS / 1000.0)
+            _ui_update_queue.put_nowait(True)
+        except queue.Full:
+            pass
+        except Exception:
+            break
+
+
+def _build_display_snapshot(snapshot):
+    """Порог 0.6 км/ч. Ноль на UI только после N подряд именно нулей из state (ниже порога — не считаем)."""
+    global _display_speed_1, _display_speed_2, _consecutive_zeros_1, _consecutive_zeros_2
+    threshold_ms = SPEED_DISPLAY_THRESHOLD_KMH / 3.6
+    raw_r1, raw_r2 = snapshot["rider1_speed"], snapshot["rider2_speed"]
+    # Для отображения: ниже порога показываем как 0 (или держим предыдущее)
+    r1 = raw_r1 if raw_r1 * 3.6 >= SPEED_DISPLAY_THRESHOLD_KMH else 0
+    r2 = raw_r2 if raw_r2 * 3.6 >= SPEED_DISPLAY_THRESHOLD_KMH else 0
+    # Считаем подряд только «настоящие» нули (state прислал 0), не «ниже порога»
+    real_zero_1 = raw_r1 <= 0 or raw_r1 * 3.6 < 0.01
+    real_zero_2 = raw_r2 <= 0 or raw_r2 * 3.6 < 0.01
+
+    if real_zero_1:
+        _consecutive_zeros_1 += 1
+        if _consecutive_zeros_1 >= CONSECUTIVE_ZEROS_REQUIRED:
+            _display_speed_1 = 0
+        elif _display_speed_1 >= threshold_ms:
+            r1 = _display_speed_1
+    else:
+        _consecutive_zeros_1 = 0
+        if r1 >= threshold_ms:
+            _display_speed_1 = r1
+        elif _display_speed_1 >= threshold_ms:
+            r1 = _display_speed_1
+
+    if real_zero_2:
+        _consecutive_zeros_2 += 1
+        if _consecutive_zeros_2 >= CONSECUTIVE_ZEROS_REQUIRED:
+            _display_speed_2 = 0
+        elif _display_speed_2 >= threshold_ms:
+            r2 = _display_speed_2
+    else:
+        _consecutive_zeros_2 = 0
+        if r2 >= threshold_ms:
+            _display_speed_2 = r2
+        elif _display_speed_2 >= threshold_ms:
+            r2 = _display_speed_2
+
+    return {**snapshot, "rider1_speed": r1, "rider2_speed": r2}
+
+
+def _ui_drain_and_update(state):
+    """Главный поток: забирает запросы, тянет данные; рендер полос/подписей — реже (UI_RENDER_MS)."""
+    global _last_render_time
     try:
-        update_gui()
-        root.after(UI_REFRESH_MS, _ui_refresh_loop)
+        while True:
+            try:
+                _ui_update_queue.get_nowait()
+            except queue.Empty:
+                break
+        snapshot = state.get_snapshot()
+        _update_stopwatch_labels(state)
+        now = time.time()
+        if (now - _last_render_time) * 1000 >= UI_RENDER_MS:
+            _last_render_time = now
+            display_snapshot = _build_display_snapshot(snapshot)
+            max_speed_label1.config(text=f"{snapshot['rider1_max_speed'] * 3.6:.2f} км/ч макс.")
+            max_speed_label2.config(text=f"{snapshot['rider2_max_speed'] * 3.6:.2f} км/ч макс.")
+            update_projection(display_snapshot)
+    except (NameError, tk.TclError):
+        pass
+    try:
+        root.after(UI_REFRESH_MS, lambda: _ui_drain_and_update(state))
     except (NameError, tk.TclError):
         pass
 
 
-def reset_race():
+def reset_race(state):
     """Сброс гонки: остановить обратный отсчёт/секундомеры, обнулить время, финиш и макс. скорость."""
-    global race_start_time, rider1_start_revs, rider2_start_revs, rider1_finished_time, rider2_finished_time
-    global rider1_max_speed, rider2_max_speed
-    global _stopwatch_after_id, _countdown_visible, _countdown_after_ids, _finished_beeped
-    _finished_beeped = {1: False, 2: False}
-    race_start_time = None
-    rider1_start_revs = None
-    rider2_start_revs = None
-    rider1_finished_time = None
-    rider2_finished_time = None
-    rider1_max_speed = 0
-    rider2_max_speed = 0
-    _countdown_visible = 0
-    for aid in _countdown_after_ids:
+    with state._lock_race:
+        after_ids = list(state._countdown_after_ids)
+        stopwatch_id = state._stopwatch_after_id
+        state._countdown_after_ids = []
+        state._stopwatch_after_id = None
+    for aid in after_ids:
         try:
             root.after_cancel(aid)
         except Exception:
             pass
-    _countdown_after_ids = []
+    if stopwatch_id is not None:
+        try:
+            root.after_cancel(stopwatch_id)
+        except Exception:
+            pass
+    state.reset_race_state()
     try:
         start_race_button.config(state=tk.NORMAL)
     except NameError:
         pass
-    if _stopwatch_after_id is not None:
-        try:
-            root.after_cancel(_stopwatch_after_id)
-        except Exception:
-            pass
-        _stopwatch_after_id = None
-    _update_stopwatch_labels()
+    _update_stopwatch_labels(state)
     try:
         max_speed_label1.config(text="0.00 км/ч макс.")
         max_speed_label2.config(text="0.00 км/ч макс.")
@@ -537,21 +728,13 @@ def reset_race():
         pass
 
 
-# Функция для обновления интерфейса
-def update_gui():
-    global rider1_speed, rider2_speed
-    now = time.time()
-    # Сбрасывать в 0 только если уже были данные и прошло больше SPEED_STALE_SEC без новых (0 = «данных ещё не было»)
-    t1 = _last_speed_time.get(1, 0)
-    if t1 > 0 and (now - t1) > SPEED_STALE_SEC:
-        rider1_speed = 0
-    t2 = _last_speed_time.get(2, 0)
-    if t2 > 0 and (now - t2) > SPEED_STALE_SEC:
-        rider2_speed = 0
-    _update_stopwatch_labels()
-    max_speed_label1.config(text=f"{rider1_max_speed * 3.6:.2f} км/ч макс.")
-    max_speed_label2.config(text=f"{rider2_max_speed * 3.6:.2f} км/ч макс.")
-    update_projection()
+def update_gui(state):
+    """Обновить интерфейс по снимку state (вызывается из главного потока)."""
+    snapshot = state.get_snapshot()
+    _update_stopwatch_labels(state)
+    max_speed_label1.config(text=f"{snapshot['rider1_max_speed'] * 3.6:.2f} км/ч макс.")
+    max_speed_label2.config(text=f"{snapshot['rider2_max_speed'] * 3.6:.2f} км/ч макс.")
+    update_projection(_build_display_snapshot(snapshot))
 
 # Функция для обновления проекции гонки
 def _draw_round_rect(c, x1, y1, x2, y2, radius, **kw):
@@ -572,41 +755,64 @@ def _draw_round_rect(c, x1, y1, x2, y2, radius, **kw):
     c.create_rectangle(x1 + rad, y2 - rad, x2 - rad, y2, fill=fill, outline=outline)
 
 
-def update_projection(_event=None):
+def update_projection(snapshot_or_event=None):
+    """Перерисовать полоски: при установленном расстоянии — прогресс 0..расстояние (м), иначе — скорость (км/ч)."""
+    if isinstance(snapshot_or_event, dict):
+        snapshot = snapshot_or_event
+    else:
+        try:
+            snapshot = _build_display_snapshot(app_state.get_snapshot())
+        except NameError:
+            return
     canvas.delete("all")
-    # Масштабирование под текущий размер канваса
     w = max(canvas.winfo_width(), 360)
     h = max(canvas.winfo_height(), 180)
     pad = 24
     bar_h = min(28, (h - 80) // 2 - 10)
     gap = 20
-    label_w = 70
+    label_w = 140
     max_bar_w = w - pad * 2 - label_w
-    scale = max((rider1_speed, rider2_speed), default=1) or 1
-    bar_scale = max_bar_w / max(scale * 1.2, 1)
+    dist_target = snapshot.get("distance") or 0
+    d1 = snapshot.get("rider1_distance") or 0
+    d2 = snapshot.get("rider2_distance") or 0
+    r1 = snapshot["rider1_speed"]
+    r2 = snapshot["rider2_speed"]
 
-    # Гонщик 1
+    if dist_target > 0:
+        # Полоски по пройденному расстоянию (накопление по приходящей скорости): от 0 до установленного (м)
+        progress1 = min(d1 / dist_target, 1.0)
+        progress2 = min(d2 / dist_target, 1.0)
+        bar1_w = max_bar_w if progress1 >= 1.0 else int(progress1 * max_bar_w)
+        bar2_w = max_bar_w if progress2 >= 1.0 else int(progress2 * max_bar_w)
+        label1 = f"{d1:.1f} / {dist_target:.0f} м   {r1 * 3.6:.1f} км/ч"
+        label2 = f"{d2:.1f} / {dist_target:.0f} м   {r2 * 3.6:.1f} км/ч"
+    else:
+        # Без установленного расстояния — по скорости (как раньше)
+        scale = max((r1, r2), default=1) or 1
+        bar_scale = max_bar_w / max(scale * 1.2, 1)
+        bar1_w = min(int(r1 * bar_scale), max_bar_w)
+        bar2_w = min(int(r2 * bar_scale), max_bar_w)
+        label1 = f"{r1 * 3.6:.1f} км/ч"
+        label2 = f"{r2 * 3.6:.1f} км/ч"
+
+    bar_right = pad + max_bar_w
     y1 = pad + 30
-    _draw_round_rect(canvas, pad, y1, w - pad, y1 + bar_h, 14, fill=COLORS["divider"], outline="")
-    bar1_w = min(int(rider1_speed * bar_scale), max_bar_w)
+    _draw_round_rect(canvas, pad, y1, bar_right, y1 + bar_h, 14, fill=COLORS["divider"], outline="")
     if bar1_w > 0:
         _draw_round_rect(canvas, pad, y1, pad + bar1_w, y1 + bar_h, 14, fill=COLORS["rider1"], outline="")
-    canvas.create_text(pad + max_bar_w + 8, y1 + bar_h // 2, text=f"{rider1_speed * 3.6:.1f} км/ч", fill=COLORS["on_surface"], font=("Segoe UI", 10, "bold"), anchor="w")
+    canvas.create_text(bar_right + 8, y1 + bar_h // 2, text=label1, fill=COLORS["on_surface"], font=("Segoe UI", 10, "bold"), anchor="w")
 
-    # Гонщик 2
     y2 = y1 + bar_h + gap + 30
-    _draw_round_rect(canvas, pad, y2, w - pad, y2 + bar_h, 14, fill=COLORS["divider"], outline="")
-    bar2_w = min(int(rider2_speed * bar_scale), max_bar_w)
+    _draw_round_rect(canvas, pad, y2, bar_right, y2 + bar_h, 14, fill=COLORS["divider"], outline="")
     if bar2_w > 0:
         _draw_round_rect(canvas, pad, y2, pad + bar2_w, y2 + bar_h, 14, fill=COLORS["rider2"], outline="")
-    canvas.create_text(pad + max_bar_w + 8, y2 + bar_h // 2, text=f"{rider2_speed * 3.6:.1f} км/ч", fill=COLORS["on_surface"], font=("Segoe UI", 10, "bold"), anchor="w")
+    canvas.create_text(bar_right + 8, y2 + bar_h // 2, text=label2, fill=COLORS["on_surface"], font=("Segoe UI", 10, "bold"), anchor="w")
 
-# Функция для установки расстояния
-def set_distance():
-    global distance
+def set_distance(state):
     try:
-        distance = float(distance_entry.get())
-        update_gui()
+        with state._lock_race:
+            state.distance = float(distance_entry.get())
+        _ui_update_queue.put_nowait(True)
     except ValueError:
         pass
 
@@ -818,7 +1024,7 @@ def open_settings():
                     RIDER1_ADDRESS = a1
                     RIDER2_ADDRESS = a2
                     save_sensor_addresses(a1, a2)
-                    restart_bleak_tasks()
+                    restart_bleak_tasks(app_state)
                     log_msg("[Применить] Адреса сохранены, подключение перезапущено.")
                     btn_apply.configure(state=tk.NORMAL)
                 root.after(0, update_ui)
@@ -962,7 +1168,7 @@ def _find_csc_measurement_uuid(client):
 
 # Асинхронная функция для подключения к датчику
 # rider_numbers: один int (1 или 2) или список [1, 2] — один датчик на двух гонщиков
-async def connect_to_rider(address, rider_numbers):
+async def connect_to_rider(address, rider_numbers, state):
     if isinstance(rider_numbers, int):
         rider_numbers = [rider_numbers]
     client_arg = _ble_device_from_address(address)
@@ -971,9 +1177,9 @@ async def connect_to_rider(address, rider_numbers):
             for r in rider_numbers:
                 root.after(0, lambda rn=r: set_sensor_status(rn, "Подключён"))
             char_uuid = _find_csc_measurement_uuid(client) or SPEED_CHARACTERISTIC_UUID
-            def callback(sender, data, riders=rider_numbers):
+            def callback(sender, data, riders=rider_numbers, st=state):
                 for r in riders:
-                    handle_speed_data(sender, data, r)
+                    handle_speed_data(sender, data, r, st)
             try:
                 await client.start_notify(char_uuid, callback)
                 if DEBUG_RAW_BLE:
@@ -1022,14 +1228,14 @@ async def verify_connection_async(address):
 SECOND_SENSOR_DELAY_SEC = 2.0
 
 
-async def _connect_second_rider_delayed():
+async def _connect_second_rider_delayed(state):
     """Подключить второй датчик с задержкой, чтобы первый успел установиться."""
     await asyncio.sleep(SECOND_SENSOR_DELAY_SEC)
-    await connect_to_rider(RIDER2_ADDRESS, 2)
+    await connect_to_rider(RIDER2_ADDRESS, 2, state)
 
 
-# Запуск асинхронных задач (использует текущие RIDER1_ADDRESS, RIDER2_ADDRESS)
-def start_bleak_tasks():
+def start_bleak_tasks(state):
+    """Запуск асинхронных задач BLE (использует текущие RIDER1_ADDRESS, RIDER2_ADDRESS)."""
     global ble_loop, ble_tasks
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -1038,14 +1244,12 @@ def start_bleak_tasks():
     valid2 = _is_valid_ble_address(RIDER2_ADDRESS)
     tasks = []
     if valid1 and valid2 and RIDER1_ADDRESS.strip() == RIDER2_ADDRESS.strip():
-        # Один датчик на обоих гонщиков
-        tasks.append(loop.create_task(connect_to_rider(RIDER1_ADDRESS, [1, 2])))
+        tasks.append(loop.create_task(connect_to_rider(RIDER1_ADDRESS, [1, 2], state)))
     else:
         if valid1:
-            tasks.append(loop.create_task(connect_to_rider(RIDER1_ADDRESS, 1)))
+            tasks.append(loop.create_task(connect_to_rider(RIDER1_ADDRESS, 1, state)))
         if valid2:
-            # Второй датчик — с задержкой, чтобы оба подключения не конкурировали
-            tasks.append(loop.create_task(_connect_second_rider_delayed()))
+            tasks.append(loop.create_task(_connect_second_rider_delayed(state)))
     ble_tasks = tasks
     try:
         loop.run_forever()
@@ -1054,8 +1258,7 @@ def start_bleak_tasks():
         ble_tasks = []
 
 
-# Перезапуск BLE-подключений с новыми адресами (без перезагрузки приложения)
-def restart_bleak_tasks():
+def restart_bleak_tasks(state):
     old_loop = ble_loop
     old_tasks = list(ble_tasks) if ble_tasks else []
 
@@ -1067,9 +1270,9 @@ def restart_bleak_tasks():
     root.after(0, lambda: (set_sensor_status(1, "Не подключён"), set_sensor_status(2, "Не подключён")))
     if old_loop and not old_loop.is_closed():
         old_loop.call_soon_threadsafe(stop_loop)
-        root.after(400, lambda: threading.Thread(target=start_bleak_tasks, daemon=True).start())
+        root.after(400, lambda: threading.Thread(target=start_bleak_tasks, args=(state,), daemon=True).start())
     else:
-        threading.Thread(target=start_bleak_tasks, daemon=True).start()
+        threading.Thread(target=start_bleak_tasks, args=(state,), daemon=True).start()
 
 # Минимальный размер окна
 MIN_WIDTH = 700
@@ -1103,16 +1306,17 @@ tk.Label(card_dist, text="Расстояние", font=font_subtitle, fg=COLORS["
 dist_row = tk.Frame(card_dist, bg=COLORS["surface_card"])
 dist_row.pack(fill=tk.X, pady=(8, 0))
 distance_entry = tk.Entry(dist_row, font=font_body, width=12, relief=tk.FLAT, bd=0, highlightthickness=1, highlightcolor=COLORS["primary"], highlightbackground=COLORS["divider"])
+distance_entry.insert(0, "250")
 distance_entry.pack(side=tk.LEFT, padx=(0, 10), ipady=8, ipadx=10)
-set_distance_button = tk.Button(dist_row, text="Установить", font=font_body, fg=COLORS["on_primary"], bg=COLORS["primary"], activeforeground=COLORS["on_primary"], activebackground=COLORS["primary_dark"], relief=tk.FLAT, padx=16, pady=8, cursor="hand2", command=set_distance)
+set_distance_button = tk.Button(dist_row, text="Установить", font=font_body, fg=COLORS["on_primary"], bg=COLORS["primary"], activeforeground=COLORS["on_primary"], activebackground=COLORS["primary_dark"], relief=tk.FLAT, padx=16, pady=8, cursor="hand2", command=lambda: set_distance(app_state))
 set_distance_button.pack(side=tk.LEFT)
 set_distance_button.bind("<Enter>", lambda e: set_distance_button.config(bg=COLORS["primary_dark"]))
 set_distance_button.bind("<Leave>", lambda e: set_distance_button.config(bg=COLORS["primary"]))
-start_race_button = tk.Button(dist_row, text="Старт", font=font_body, fg=COLORS["on_primary"], bg=COLORS["secondary"], activeforeground=COLORS["on_primary"], activebackground=COLORS["secondary_dark"], relief=tk.FLAT, padx=16, pady=8, cursor="hand2", command=start_race)
+start_race_button = tk.Button(dist_row, text="Старт", font=font_body, fg=COLORS["on_primary"], bg=COLORS["secondary"], activeforeground=COLORS["on_primary"], activebackground=COLORS["secondary_dark"], relief=tk.FLAT, padx=16, pady=8, cursor="hand2", command=lambda: start_race(app_state))
 start_race_button.pack(side=tk.LEFT, padx=(8, 0))
 start_race_button.bind("<Enter>", lambda e: start_race_button.config(bg=COLORS["secondary_dark"]))
 start_race_button.bind("<Leave>", lambda e: start_race_button.config(bg=COLORS["secondary"]))
-reset_race_button = tk.Button(dist_row, text="Сброс", font=font_body, fg=COLORS["on_surface"], bg=COLORS["divider"], activeforeground=COLORS["on_surface"], activebackground=COLORS["on_surface_secondary"], relief=tk.FLAT, padx=14, pady=8, cursor="hand2", command=reset_race)
+reset_race_button = tk.Button(dist_row, text="Сброс", font=font_body, fg=COLORS["on_surface"], bg=COLORS["divider"], activeforeground=COLORS["on_surface"], activebackground=COLORS["on_surface_secondary"], relief=tk.FLAT, padx=14, pady=8, cursor="hand2", command=lambda: reset_race(app_state))
 reset_race_button.pack(side=tk.LEFT, padx=(8, 0))
 reset_race_button.bind("<Enter>", lambda e: reset_race_button.config(bg="#CCCCCC"))
 reset_race_button.bind("<Leave>", lambda e: reset_race_button.config(bg=COLORS["divider"]))
@@ -1160,10 +1364,14 @@ canvas = tk.Canvas(card_canvas, width=MIN_WIDTH - 40, height=220, bg=COLORS["sur
 canvas.pack(fill=tk.BOTH, expand=True)
 canvas.bind("<Configure>", update_projection)  # перерисовка при изменении размера
 root.after(100, update_projection)  # initial draw
-root.after(UI_REFRESH_MS, _ui_refresh_loop)  # частое обновление времени и скорости
 
-# Запуск асинхронных задач в отдельном потоке
-threading.Thread(target=start_bleak_tasks, daemon=True).start()
+# Поток, который непрерывно запрашивает обновление UI (каждые UI_REFRESH_MS мс кладёт в очередь)
+threading.Thread(target=_ui_refresh_worker, args=(app_state,), daemon=True).start()
+# Главный поток забирает из очереди и обновляет виджеты (тянет данные из app_state)
+root.after(UI_REFRESH_MS, lambda: _ui_drain_and_update(app_state))
+
+# Запуск BLE в отдельном потоке
+threading.Thread(target=start_bleak_tasks, args=(app_state,), daemon=True).start()
 
 # Запуск основного цикла
 root.mainloop()

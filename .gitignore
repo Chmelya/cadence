@@ -1,0 +1,4 @@
+# Сборка приложения (PyInstaller)
+dist/
+build/
+*.spec
