@@ -1,0 +1,18 @@
+{
+  "scanned_devices": [
+    {
+      "name": "(Без имени) 4C:C9:5E:1B:2E:09",
+      "address": "4C:C9:5E:1B:2E:09"
+    },
+    {
+      "name": "C5 S-0050735",
+      "address": "F1:07:AF:43:97:98"
+    },
+    {
+      "name": "C5 S-0050703",
+      "address": "EC:AB:78:43:EE:DB"
+    }
+  ],
+  "sensor1": "EC:AB:78:43:EE:DB",
+  "sensor2": "F1:07:AF:43:97:98"
+}

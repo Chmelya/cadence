@@ -1,0 +1,38 @@
+{
+  "sensor1": "EC:AB:78:43:EE:DB",
+  "sensor2": "F1:07:AF:43:97:98",
+  "scanned_devices": [
+    {
+      "name": "RMC-M40S",
+      "address": "EB:B0:0A:70:C1:A7"
+    },
+    {
+      "name": "(Без имени) 4C:C9:5E:1B:2E:09",
+      "address": "4C:C9:5E:1B:2E:09"
+    },
+    {
+      "name": "(Без имени) 12:07:36:3E:14:D9",
+      "address": "12:07:36:3E:14:D9"
+    },
+    {
+      "name": "C5 S-0050735",
+      "address": "F1:07:AF:43:97:98"
+    },
+    {
+      "name": "(Без имени) 67:52:5C:E6:AB:DE",
+      "address": "67:52:5C:E6:AB:DE"
+    },
+    {
+      "name": "(Без имени) 1F:72:63:D9:CD:6E",
+      "address": "1F:72:63:D9:CD:6E"
+    },
+    {
+      "name": "(Без имени) CD:7B:8F:18:30:BC",
+      "address": "CD:7B:8F:18:30:BC"
+    },
+    {
+      "name": "C5 S-0050703",
+      "address": "EC:AB:78:43:EE:DB"
+    }
+  ]
+}
